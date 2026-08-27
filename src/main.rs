@@ -8,7 +8,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
     Application, ApplicationWindow, Box as GtkBox, Entry, Label, ListBox, ListBoxRow,
-    Orientation, ScrolledWindow, SelectionMode, TextBuffer, TextView,
+    Orientation, ScrolledWindow, SelectionMode, TextBuffer, TextView, WrapMode,
 };
 use irc::client::prelude::*;
 use irc::client::ClientStream;
@@ -25,6 +25,15 @@ const KEY_SEP: char = '\u{2}';
 
 fn timestamp() -> String {
     chrono::Local::now().format("%H:%M").to_string()
+}
+
+// Extracts and formats the "time" message tag (IRCv3 server-time cap):
+// an RFC3339 UTC timestamp the server attaches to a message, distinct from
+// whenever we happened to receive it.
+fn tag_time(message: &Message) -> Option<String> {
+    let raw = message.tags.as_ref()?.iter().find(|t| t.0 == "time")?.1.as_deref()?;
+    let parsed = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
+    Some(parsed.with_timezone(&chrono::Local).format("%H:%M").to_string())
 }
 
 // Builds the reply body (without \x01 delimiters) for a known CTCP request,
@@ -71,8 +80,11 @@ fn split_key(key: &str) -> (String, String) {
 
 // What the GTK main loop receives from an IRC background thread.
 enum IrcEvent {
-    // A line to append to the `server`/`target` buffer.
-    Line { server: String, target: String, text: String },
+    // A line to append to the `server`/`target` buffer. `time`, when set,
+    // came from the server's own "time" message tag (server-time cap) —
+    // used instead of local receive time so replayed/delayed messages show
+    // when they actually happened, not when we happened to see them.
+    Line { server: String, target: String, text: String, time: Option<String> },
     // The full, current member list for `server`/`channel` (replaces, not merges).
     Names { server: String, channel: String, nicks: Vec<String> },
 }
@@ -89,7 +101,7 @@ fn build_ui(app: &Application) {
         .width_request(180)
         .build();
 
-    let text_view = TextView::builder().editable(false).build();
+    let text_view = TextView::builder().editable(false).wrap_mode(WrapMode::WordChar).build();
     let scroller = ScrolledWindow::builder()
         .child(&text_view)
         .vexpand(true)
@@ -278,10 +290,10 @@ fn build_ui(app: &Application) {
     glib::spawn_future_local(async move {
         while let Ok(event) = irc_rx.recv().await {
             match event {
-                IrcEvent::Line { server, target, text } => {
+                IrcEvent::Line { server, target, text, time } => {
                     let buf = get_or_create_buffer(&server, &target);
                     let mut end = buf.end_iter();
-                    buf.insert(&mut end, &format!("[{}] {}\n", timestamp(), text));
+                    buf.insert(&mut end, &format!("[{}] {}\n", time.unwrap_or_else(timestamp), text));
 
                     // Only auto-scroll if the (server, target) that just got
                     // a line is the one currently visible.
@@ -308,7 +320,7 @@ async fn run_irc(cfg: ServerConfig, tx: async_channel::Sender<IrcEvent>, out_rx:
         let server = server_name.clone();
         let target = target.to_owned();
         async move {
-            let _ = tx.send(IrcEvent::Line { server, target, text }).await;
+            let _ = tx.send(IrcEvent::Line { server, target, text, time: None }).await;
         }
     };
 
@@ -345,7 +357,12 @@ async fn run_irc(cfg: ServerConfig, tx: async_channel::Sender<IrcEvent>, out_rx:
     // every capability the server offers. identify() below sends the
     // CAP END that actually closes out negotiation and proceeds to
     // NICK/USER, so it must run after this, not instead of this.
-    negotiate(&client, &server_name, sasl_account.as_deref(), sasl_password.as_deref(), &mut stream, &tx).await;
+    let mut granted_caps = negotiate(&client, &server_name, sasl_account.as_deref(), sasl_password.as_deref(), &mut stream, &tx).await;
+    if !granted_caps.is_empty() {
+        let mut caps: Vec<&str> = granted_caps.iter().map(String::as_str).collect();
+        caps.sort_unstable();
+        send(SERVER_TARGET, format!("capabilities enabled: {}", caps.join(", "))).await;
+    }
 
     if let Err(e) = client.identify() {
         send(SERVER_TARGET, format!("identify error: {e}")).await;
@@ -357,13 +374,20 @@ async fn run_irc(cfg: ServerConfig, tx: async_channel::Sender<IrcEvent>, out_rx:
     let mut channel_members: HashMap<String, Vec<String>> = HashMap::new();
     // Accumulates RPL_NAMREPLY (353) lines until RPL_ENDOFNAMES (366).
     let mut names_buffer: HashMap<String, Vec<String>> = HashMap::new();
+    // Batches in progress (batch cap): reference id -> (batch type, buffered
+    // child messages), populated by BATCH +id and flushed on BATCH -id.
+    let mut active_batches: HashMap<String, (Option<String>, Vec<Message>)> = HashMap::new();
 
     loop {
         tokio::select! {
             incoming = stream.next() => {
                 match incoming.transpose().unwrap_or(None) {
                     Some(message) => {
-                        route_incoming(&server_name, &client, &message, &tx, &mut channel_members, &mut names_buffer).await;
+                        route_incoming(
+                            &server_name, &client, &message, &tx,
+                            &mut channel_members, &mut names_buffer,
+                            &mut granted_caps, &mut active_batches,
+                        ).await;
                     }
                     None => break,
                 }
@@ -375,7 +399,7 @@ async fn run_irc(cfg: ServerConfig, tx: async_channel::Sender<IrcEvent>, out_rx:
                 let mut split = line.splitn(2, '\u{1}');
                 let default_target = split.next().unwrap_or(SERVER_TARGET).to_owned();
                 let text = split.next().unwrap_or("");
-                if let Err(e) = handle_outgoing(&server_name, &client, &default_target, text, &tx).await {
+                if let Err(e) = handle_outgoing(&server_name, &client, &default_target, text, &tx, &granted_caps).await {
                     send(SERVER_TARGET, format!("error: {e}")).await;
                 }
             }
@@ -387,7 +411,9 @@ async fn run_irc(cfg: ServerConfig, tx: async_channel::Sender<IrcEvent>, out_rx:
 // WeeChat enables by default (minus a few we have no use for yet, like
 // metadata/monitor). "sasl" is added separately, only when a password is
 // configured, since requesting it with nothing to authenticate is pointless.
-const WANTED_CAPS: [Capability; 10] = [
+// Also used post-registration (cap-notify) to decide which newly-offered
+// capabilities are worth auto-requesting via CAP NEW.
+const WANTED_CAPS: [Capability; 13] = [
     Capability::MultiPrefix,
     Capability::AwayNotify,
     Capability::AccountNotify,
@@ -398,7 +424,20 @@ const WANTED_CAPS: [Capability; 10] = [
     Capability::InviteNotify,
     Capability::UserhostInNames,
     Capability::Batch,
+    Capability::ExtendedJoin,
+    Capability::Custom("draft/chathistory"),
+    Capability::Custom("draft/multiline"),
 ];
+
+// The capability list lands in the 3rd tuple field of `Command::CAP` for
+// the common 3-arg wire shape ("<nick> SUB :caps") and only in the 4th for
+// the rarer 4-arg shape (used by LS continuations). Shared by every CAP
+// sub-command handler so this doesn't get re-derived (and re-broken) per
+// call site — reading only the 4th field once cost us a live duplicate-
+// message bug (see git history) because it's `None` in the common case.
+fn cap_arg<'a>(third: &'a Option<String>, fourth: &'a Option<String>) -> &'a str {
+    fourth.as_deref().or(third.as_deref()).unwrap_or("")
+}
 
 /// Runs CAP LS -> CAP REQ -> (optionally) SASL PLAIN, entirely before
 /// registration. Does *not* send CAP END — the caller finishes with
@@ -413,24 +452,24 @@ async fn negotiate(
     sasl_password: Option<&str>,
     stream: &mut ClientStream,
     tx: &async_channel::Sender<IrcEvent>,
-) {
+) -> HashSet<String> {
     let log = |text: String| {
         let tx = tx.clone();
         let server = server_name.to_owned();
         async move {
-            let _ = tx.send(IrcEvent::Line { server, target: SERVER_TARGET.to_owned(), text }).await;
+            let _ = tx.send(IrcEvent::Line { server, target: SERVER_TARGET.to_owned(), text, time: None }).await;
         }
     };
 
     if client.send_cap_ls(NegotiationVersion::V302).is_err() {
-        return;
+        return HashSet::new();
     }
 
     // Accumulate CAP LS (possibly multi-line, continued via a "*" marker
     // under IRCv3.2) until the server signals it's done listing.
     let mut offered: HashSet<String> = HashSet::new();
     loop {
-        let Some(Ok(message)) = stream.next().await else { return };
+        let Some(Ok(message)) = stream.next().await else { return HashSet::new() };
         match &message.command {
             Command::CAP(_, CapSubCommand::LS, third, fourth) => {
                 let (more, text) = match (third.as_deref(), fourth.as_deref()) {
@@ -455,26 +494,30 @@ async fn negotiate(
         wanted.push(Capability::Sasl);
     }
     if wanted.is_empty() || client.send_cap_req(&wanted).is_err() {
-        return;
+        return HashSet::new();
     }
 
     // Wait for the REQ to be ACKed or NAKed. Treated as atomic (one REQ ->
     // one ACK/NAK covering the whole list), which holds for the servers
     // this matters for in practice.
+    let granted: HashSet<String>;
     loop {
-        let Some(Ok(message)) = stream.next().await else { return };
+        let Some(Ok(message)) = stream.next().await else { return HashSet::new() };
         match &message.command {
-            Command::CAP(_, CapSubCommand::ACK, _, param) => {
-                let granted = param.as_deref().unwrap_or("");
-                if want_sasl && granted.split_whitespace().any(|c| c == "sasl") {
+            Command::CAP(_, CapSubCommand::ACK, third, fourth) => {
+                let acked: HashSet<String> = cap_arg(third, fourth).split_whitespace().map(str::to_owned).collect();
+                if want_sasl && acked.contains("sasl") {
                     let _ = client.send(Command::AUTHENTICATE("PLAIN".to_owned()));
+                    granted = acked;
                     break;
                 }
-                return; // nothing left to wait on
+                return acked; // nothing left to wait on
             }
-            Command::CAP(_, CapSubCommand::NAK, _, param) => {
-                log(format!("server rejected capabilities: {}", param.as_deref().unwrap_or("(unknown)"))).await;
-                return;
+            Command::CAP(_, CapSubCommand::NAK, third, fourth) => {
+                let cap_list = cap_arg(third, fourth);
+                let cap_list = if cap_list.is_empty() { "(unknown)" } else { cap_list };
+                log(format!("server rejected capabilities: {cap_list}")).await;
+                return HashSet::new();
             }
             _ => log(display_raw(&message)).await,
         }
@@ -485,14 +528,14 @@ async fn negotiate(
     let account = sasl_account.unwrap_or_default();
     let password = sasl_password.unwrap_or_default();
     loop {
-        let Some(Ok(message)) = stream.next().await else { return };
+        let Some(Ok(message)) = stream.next().await else { return granted };
         match &message.command {
             Command::AUTHENTICATE(data) if data == "+" => {
                 let payload = format!("\u{0}{account}\u{0}{password}");
                 let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
                 let _ = client.send(Command::AUTHENTICATE(encoded));
             }
-            Command::Response(Response::RPL_LOGGEDIN | Response::RPL_SASLSUCCESS, _) => return,
+            Command::Response(Response::RPL_LOGGEDIN | Response::RPL_SASLSUCCESS, _) => return granted,
             Command::Response(
                 Response::ERR_NICKLOCKED
                 | Response::ERR_SASLFAIL
@@ -502,10 +545,143 @@ async fn negotiate(
                 args,
             ) => {
                 log(format!("SASL authentication failed: {}", args.join(" "))).await;
-                return;
+                return granted;
             }
             _ => log(display_raw(&message)).await,
         }
+    }
+}
+
+// Formats a single message into (target, text) for display. Shared between
+// the live path and batch replay (chathistory, netsplit/netjoin, unknown
+// vendor batches) — `ctcp_client` is `Some` only for the live path, so a
+// replayed historical CTCP request doesn't trigger a fresh auto-reply.
+fn format_display(our_nick: &str, sender: &str, message: &Message, ctcp_client: Option<&Client>, extended_join: bool) -> (String, String) {
+    match &message.command {
+        Command::PRIVMSG(target, text) if text.starts_with('\u{1}') && text.ends_with('\u{1}') => {
+            // A CTCP request (VERSION, PING, TIME, ...), not a chat
+            // message — log it to (server) instead of spawning a tab for
+            // whatever bot/client sent it.
+            let ctcp = text.trim_matches('\u{1}');
+            if let (Some(reply), Some(client)) = (ctcp_reply(ctcp), ctcp_client) {
+                // Modeled on WeeChat's irc-ctcp.c: reply via NOTICE, wrapped
+                // in \x01, and strip any embedded \x01 from what we echo
+                // back (CVE-2022-2663 — a stray delimiter here can be used
+                // to smuggle data past some firewalls' IRC connection
+                // tracking).
+                let safe_reply = reply.replace('\u{1}', " ");
+                let _ = client.send(Command::NOTICE(sender.to_owned(), format!("\u{1}{safe_reply}\u{1}")));
+            }
+            (SERVER_TARGET.to_owned(), format!("CTCP {ctcp} from {sender}"))
+        }
+        Command::PRIVMSG(target, text) => {
+            let target = if target == our_nick { sender } else { target.as_str() };
+            (target.to_owned(), format!("<{sender}> {text}"))
+        }
+        Command::NOTICE(target, text) => {
+            // Any non-channel NOTICE is service/informational chatter
+            // (NickServ, ident/auth, CTCP replies) — route to (server) like
+            // HexChat does, rather than spawning a tab per sender. Before
+            // registration these can target a placeholder like "AUTH"
+            // rather than our actual nick, so check the channel prefix
+            // instead of comparing against our_nick. Channel NOTICEs still
+            // go to their channel.
+            let target = if target.starts_with(['#', '&', '!', '+']) { target.as_str() } else { SERVER_TARGET };
+            (target.to_owned(), format!("-{sender}- {text}"))
+        }
+        Command::JOIN(chan, account, _realname) => {
+            // With extended-join granted, the crate (mis-)parses the extra
+            // JOIN fields into the "key"/"password" slots positionally —
+            // they're really account and realname on receive. "*" means
+            // "not logged into an account".
+            let mut text = format!("{sender} joined {chan}");
+            if extended_join {
+                if let Some(acc) = account {
+                    if acc != "*" && !acc.is_empty() {
+                        text.push_str(&format!(" (account: {acc})"));
+                    }
+                }
+            }
+            (chan.clone(), text)
+        }
+        Command::PART(chan, reason) => (
+            chan.clone(),
+            format!("{sender} left {chan}{}", reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default()),
+        ),
+        Command::KICK(chan, nick, reason) => (
+            chan.clone(),
+            format!("{sender} kicked {nick}{}", reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default()),
+        ),
+        Command::QUIT(reason) => (
+            SERVER_TARGET.to_owned(),
+            format!("{sender} quit{}", reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default()),
+        ),
+        Command::NICK(new_nick) => (SERVER_TARGET.to_owned(), format!("{sender} is now known as {new_nick}")),
+        Command::INVITE(nick, chan) => {
+            if nick == our_nick {
+                (SERVER_TARGET.to_owned(), format!("{sender} invited you to {chan}"))
+            } else {
+                (SERVER_TARGET.to_owned(), format!("{sender} invited {nick} to {chan}"))
+            }
+        }
+        Command::Response(Response::RPL_TOPIC, args) => (
+            args.get(1).cloned().unwrap_or_else(|| SERVER_TARGET.to_owned()),
+            format!("topic: {}", args.get(2).cloned().unwrap_or_default()),
+        ),
+        Command::Response(_, args) => (SERVER_TARGET.to_owned(), args.join(" ")),
+        _ => (SERVER_TARGET.to_owned(), display_raw(message)),
+    }
+}
+
+// Flushes a completed batch (BATCH -id): reconstructs draft/multiline
+// batches into a single joined message, and replays everything else
+// (chathistory, netsplit/netjoin, unknown vendor batches) message-by-
+// message through the normal display formatting — each keeps its own
+// server-time tag, so chathistory backlog shows real historical
+// timestamps, not "now". Membership-mutating effects (JOIN/PART/QUIT
+// inside a netsplit/netjoin batch) are intentionally not replayed here;
+// only display lines are — a known simplification.
+async fn flush_batch(
+    server_name: &str,
+    our_nick: &str,
+    tx: &async_channel::Sender<IrcEvent>,
+    batch_type: Option<String>,
+    messages: Vec<Message>,
+) {
+    if batch_type.as_deref() == Some("DRAFT/MULTILINE") {
+        let mut target: Option<String> = None;
+        let mut sender: Option<String> = None;
+        let mut lines: Vec<String> = Vec::new();
+        let mut time: Option<String> = None;
+        for m in &messages {
+            if let Command::PRIVMSG(t, text) = &m.command {
+                let s = m.source_nickname().unwrap_or("?");
+                if target.is_none() {
+                    target = Some(if t == our_nick { s.to_owned() } else { t.clone() });
+                    sender = Some(s.to_owned());
+                    time = tag_time(m);
+                }
+                let concat = m.tags.as_ref().is_some_and(|tags| tags.iter().any(|tag| tag.0 == "draft/multiline-concat"));
+                if concat && !lines.is_empty() {
+                    lines.last_mut().unwrap().push_str(text);
+                } else {
+                    lines.push(text.clone());
+                }
+            }
+        }
+        if let (Some(target), Some(sender)) = (target, sender) {
+            let text = format!("<{sender}> {}", lines.join("\n"));
+            let _ = tx.send(IrcEvent::Line { server: server_name.to_owned(), target, text, time }).await;
+        }
+        return;
+    }
+
+    for m in &messages {
+        let sender = m.source_nickname().unwrap_or("?");
+        // extended_join doesn't matter for replay — historical JOINs are
+        // rare and the account annotation isn't worth the plumbing here.
+        let (target, text) = format_display(our_nick, sender, m, None, false);
+        let _ = tx.send(IrcEvent::Line { server: server_name.to_owned(), target, text, time: tag_time(m) }).await;
     }
 }
 
@@ -516,9 +692,21 @@ async fn route_incoming(
     tx: &async_channel::Sender<IrcEvent>,
     channel_members: &mut HashMap<String, Vec<String>>,
     names_buffer: &mut HashMap<String, Vec<String>>,
+    granted_caps: &mut HashSet<String>,
+    active_batches: &mut HashMap<String, (Option<String>, Vec<Message>)>,
 ) {
     let our_nick = client.current_nickname();
     let sender = message.source_nickname().unwrap_or("?");
+
+    // Any message tagged as part of an in-progress batch gets buffered
+    // instead of processed now — it's replayed (or reconstructed, for
+    // draft/multiline) when the matching BATCH -id arrives below.
+    if let Some(batch_ref) = message.tags.as_ref().and_then(|tags| tags.iter().find(|t| t.0 == "batch")).and_then(|t| t.1.clone()) {
+        if let Some((_, bucket)) = active_batches.get_mut(&batch_ref) {
+            bucket.push(message.clone());
+            return;
+        }
+    }
 
     let send_names = |tx: &async_channel::Sender<IrcEvent>, channel: &str, members: &HashMap<String, Vec<String>>| {
         let nicks = members.get(channel).cloned().unwrap_or_default();
@@ -527,6 +715,25 @@ async fn route_incoming(
         let channel = channel.to_owned();
         async move {
             let _ = tx.send(IrcEvent::Names { server, channel, nicks }).await;
+        }
+    };
+
+    // AWAY/ACCOUNT/CHGHOST (away-notify, account-notify, chghost caps)
+    // aren't targeted at a channel — the server just tells us about a user,
+    // and it's on us to show it in every channel we share with them.
+    let msg_time = tag_time(message);
+    let broadcast_to_shared = |tx: &async_channel::Sender<IrcEvent>, members: &HashMap<String, Vec<String>>, text: String| {
+        let affected: Vec<String> =
+            members.iter().filter(|(_, m)| m.iter().any(|n| n == sender)).map(|(chan, _)| chan.clone()).collect();
+        let tx = tx.clone();
+        let server = server_name.to_owned();
+        let time = msg_time.clone();
+        async move {
+            for chan in affected {
+                let _ = tx
+                    .send(IrcEvent::Line { server: server.clone(), target: chan, text: text.clone(), time: time.clone() })
+                    .await;
+            }
         }
     };
 
@@ -550,6 +757,12 @@ async fn route_incoming(
                 nicks.dedup();
                 channel_members.insert(channel.clone(), nicks);
                 send_names(tx, channel, channel_members).await;
+                // Backfill recent history right after joining, if the
+                // server supports it — this is the whole point of
+                // draft/chathistory: no more "joined and missed everything".
+                if granted_caps.contains("draft/chathistory") {
+                    let _ = client.send(format!("CHATHISTORY LATEST {channel} * 50").as_str());
+                }
             }
             return;
         }
@@ -596,64 +809,72 @@ async fn route_incoming(
                 send_names(tx, chan, channel_members).await;
             }
         }
+        Command::AWAY(reason) => {
+            let text = match reason {
+                Some(r) => format!("{sender} is away: {r}"),
+                None => format!("{sender} is no longer away"),
+            };
+            broadcast_to_shared(tx, channel_members, text).await;
+            return;
+        }
+        Command::ACCOUNT(account) => {
+            let text = if account == "*" {
+                format!("{sender} logged out")
+            } else {
+                format!("{sender} authenticated as {account}")
+            };
+            broadcast_to_shared(tx, channel_members, text).await;
+            return;
+        }
+        Command::CHGHOST(new_user, new_host) => {
+            broadcast_to_shared(tx, channel_members, format!("{sender} changed host to {new_user}@{new_host}")).await;
+            return;
+        }
+        // cap-notify: the server can offer/withdraw capabilities after
+        // registration. NEW auto-requests anything we want that we don't
+        // already have; DEL/ACK/NAK here just keep granted_caps in sync
+        // with reality (e.g. so echo-message dedup and chathistory-on-join
+        // stay correct if a cap changes mid-session).
+        Command::CAP(_, CapSubCommand::NEW, third, fourth) => {
+            let want: Vec<String> = cap_arg(third, fourth)
+                .split_whitespace()
+                .map(|tok| tok.split('=').next().unwrap_or(tok).to_owned())
+                .filter(|name| !granted_caps.contains(name) && WANTED_CAPS.iter().any(|c| c.as_ref() == name))
+                .collect();
+            if !want.is_empty() {
+                let _ = client.send(format!("CAP REQ :{}", want.join(" ")).as_str());
+            }
+            return;
+        }
+        Command::CAP(_, CapSubCommand::DEL, third, fourth) => {
+            for tok in cap_arg(third, fourth).split_whitespace() {
+                granted_caps.remove(tok.split('=').next().unwrap_or(tok));
+            }
+            return;
+        }
+        Command::CAP(_, CapSubCommand::ACK, third, fourth) => {
+            for tok in cap_arg(third, fourth).split_whitespace() {
+                granted_caps.insert(tok.to_owned());
+            }
+            return;
+        }
+        Command::CAP(..) => return, // NAK or LS arriving post-registration (rare) — nothing to do
+        Command::BATCH(reftag, subcmd, _params) => {
+            if let Some(id) = reftag.strip_prefix('+') {
+                active_batches.insert(id.to_owned(), (subcmd.as_ref().map(|s| s.to_str().to_owned()), Vec::new()));
+            } else if let Some(id) = reftag.strip_prefix('-') {
+                if let Some((batch_type, messages)) = active_batches.remove(id) {
+                    flush_batch(server_name, our_nick, tx, batch_type, messages).await;
+                }
+            }
+            return;
+        }
         _ => {}
     }
 
-    let (target, text) = match &message.command {
-        Command::PRIVMSG(target, text) if text.starts_with('\u{1}') && text.ends_with('\u{1}') => {
-            // A CTCP request (VERSION, PING, TIME, ...), not a chat
-            // message — log it to (server) instead of spawning a tab for
-            // whatever bot/client sent it.
-            let ctcp = text.trim_matches('\u{1}');
-            if let Some(reply) = ctcp_reply(ctcp) {
-                // Modeled on WeeChat's irc-ctcp.c: reply via NOTICE, wrapped
-                // in \x01, and strip any embedded \x01 from what we echo
-                // back (CVE-2022-2663 — a stray delimiter here can be used
-                // to smuggle data past some firewalls' IRC connection
-                // tracking).
-                let safe_reply = reply.replace('\u{1}', " ");
-                let _ = client.send(Command::NOTICE(sender.to_owned(), format!("\u{1}{safe_reply}\u{1}")));
-            }
-            (SERVER_TARGET.to_owned(), format!("CTCP {ctcp} from {sender}"))
-        }
-        Command::PRIVMSG(target, text) => {
-            let target = if target == our_nick { sender } else { target };
-            (target.to_owned(), format!("<{sender}> {text}"))
-        }
-        Command::NOTICE(target, text) => {
-            // Any non-channel NOTICE is service/informational chatter
-            // (NickServ, ident/auth, CTCP replies) — route to (server) like
-            // HexChat does, rather than spawning a tab per sender. Before
-            // registration these can target a placeholder like "AUTH"
-            // rather than our actual nick, so check the channel prefix
-            // instead of comparing against our_nick. Channel NOTICEs still
-            // go to their channel.
-            let target = if target.starts_with(['#', '&', '!', '+']) { target } else { SERVER_TARGET };
-            (target.to_owned(), format!("-{sender}- {text}"))
-        }
-        Command::JOIN(chan, ..) => (chan.clone(), format!("{sender} joined {chan}")),
-        Command::PART(chan, reason) => (
-            chan.clone(),
-            format!("{sender} left {chan}{}", reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default()),
-        ),
-        Command::KICK(chan, nick, reason) => (
-            chan.clone(),
-            format!("{sender} kicked {nick}{}", reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default()),
-        ),
-        Command::QUIT(reason) => (
-            SERVER_TARGET.to_owned(),
-            format!("{sender} quit{}", reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default()),
-        ),
-        Command::NICK(new_nick) => (SERVER_TARGET.to_owned(), format!("{sender} is now known as {new_nick}")),
-        Command::Response(Response::RPL_TOPIC, args) => (
-            args.get(1).cloned().unwrap_or_else(|| SERVER_TARGET.to_owned()),
-            format!("topic: {}", args.get(2).cloned().unwrap_or_default()),
-        ),
-        Command::Response(_, args) => (SERVER_TARGET.to_owned(), args.join(" ")),
-        _ => (SERVER_TARGET.to_owned(), display_raw(message)),
-    };
-
-    let _ = tx.send(IrcEvent::Line { server: server_name.to_owned(), target, text }).await;
+    let extended_join = granted_caps.contains("extended-join");
+    let (target, text) = format_display(our_nick, sender, message, Some(client), extended_join);
+    let _ = tx.send(IrcEvent::Line { server: server_name.to_owned(), target, text, time: tag_time(message) }).await;
 }
 
 async fn handle_outgoing(
@@ -662,14 +883,21 @@ async fn handle_outgoing(
     default_target: &str,
     line: &str,
     tx: &async_channel::Sender<IrcEvent>,
+    granted_caps: &HashSet<String>,
 ) -> irc::error::Result<()> {
     let our_nick = client.current_nickname().to_owned();
+    // With "echo-message" granted, the server sends our own PRIVMSG back to
+    // us like any other, and route_incoming displays it — echoing locally
+    // too would show every sent message twice.
+    let server_echoes = granted_caps.contains("echo-message");
     let echo = |tx: &async_channel::Sender<IrcEvent>, target: &str, text: String| {
         let tx = tx.clone();
         let server = server_name.to_owned();
         let target = target.to_owned();
         async move {
-            let _ = tx.send(IrcEvent::Line { server, target, text }).await;
+            if !server_echoes {
+                let _ = tx.send(IrcEvent::Line { server, target, text, time: None }).await;
+            }
         }
     };
 
@@ -685,6 +913,14 @@ async fn handle_outgoing(
                 client.send(Command::PART(target.to_owned(), None))?;
             }
             "nick" if !arg.is_empty() => client.send(Command::NICK(arg.to_owned()))?,
+            "invite" if !arg.is_empty() => {
+                let mut inv_parts = arg.splitn(2, ' ');
+                let nick = inv_parts.next().unwrap_or("");
+                let chan = inv_parts.next().unwrap_or(default_target);
+                if !nick.is_empty() {
+                    client.send(Command::INVITE(nick.to_owned(), chan.to_owned()))?;
+                }
+            }
             "msg" => {
                 let mut msg_parts = arg.splitn(2, ' ');
                 if let (Some(target), Some(text)) = (msg_parts.next(), msg_parts.next()) {
