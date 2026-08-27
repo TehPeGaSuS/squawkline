@@ -36,6 +36,16 @@ fn tag_time(message: &Message) -> Option<String> {
     Some(parsed.with_timezone(&chrono::Local).format("%H:%M").to_string())
 }
 
+// user@host from the message's own prefix, when present — used for the
+// WeeChat-style JOIN line (nick [account] (realname) (user@host) has
+// joined #channel).
+fn userhost(message: &Message) -> Option<String> {
+    match &message.prefix {
+        Some(Prefix::Nickname(_, user, host)) if !user.is_empty() && !host.is_empty() => Some(format!("{user}@{host}")),
+        _ => None,
+    }
+}
+
 // Builds the reply body (without \x01 delimiters) for a known CTCP request,
 // following the same set WeeChat answers by default (irc-ctcp.c): PING
 // echoes the requester's payload back, the rest are static/derived info.
@@ -89,13 +99,15 @@ enum IrcEvent {
     Names { server: String, channel: String, nicks: Vec<NickInfo> },
 }
 
-// A nicklist entry enriched with WHOX data (away status, account), when
-// known — falls back to just the name if we haven't WHOX'd yet.
+// A nicklist entry enriched with away status from WHOX, when known.
+// Account is deliberately not shown here — matching WeeChat's nicklist
+// (irc-nick.c tracks account per-nick but never renders it there); account
+// info instead surfaces contextually via extended-join and account-notify
+// text lines, which we already show.
 #[derive(Clone)]
 struct NickInfo {
     nick: String,
     away: bool,
-    account: Option<String>,
 }
 
 fn main() -> glib::ExitCode {
@@ -220,11 +232,7 @@ fn build_ui(app: &Application) {
             }
             if let Some(nicks) = channel_nicks.borrow().get(&key(server, target)) {
                 for info in nicks {
-                    let label_text = match &info.account {
-                        Some(acc) => format!("{} ({acc})", info.nick),
-                        None => info.nick.clone(),
-                    };
-                    let label = Label::builder().label(&label_text).xalign(0.0).build();
+                    let label = Label::builder().label(&info.nick).xalign(0.0).build();
                     if info.away {
                         // Dim rather than hide — still relevant to know
                         // who's around, just not actively present.
@@ -398,10 +406,10 @@ async fn run_irc(cfg: ServerConfig, tx: async_channel::Sender<IrcEvent>, out_rx:
     let mut active_batches: HashMap<String, (Option<String>, Vec<Message>)> = HashMap::new();
     // CHANTYPES/PREFIX/WHOX from RPL_ISUPPORT (005), updated as it arrives.
     let mut features = ServerFeatures::default();
-    // Away/account status per nick (WHOX, kept fresh by away-notify and
-    // account-notify) — a user property, not a per-channel one, so it's
-    // keyed by nick alone and shared across every channel on this server.
-    let mut nick_status: HashMap<String, (bool, Option<String>)> = HashMap::new();
+    // Away status per nick (WHOX, kept fresh by away-notify) — a user
+    // property, not a per-channel one, so it's keyed by nick alone and
+    // shared across every channel on this server.
+    let mut nick_status: HashMap<String, bool> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -665,19 +673,31 @@ fn format_display(
             let target = if target.starts_with(|c| chantypes.contains(c)) { target.as_str() } else { SERVER_TARGET };
             (target.to_owned(), format!("-{sender}- {text}"))
         }
-        Command::JOIN(chan, account, _realname) => {
+        Command::JOIN(chan, account, realname) => {
             // With extended-join granted, the crate (mis-)parses the extra
             // JOIN fields into the "key"/"password" slots positionally —
             // they're really account and realname on receive. "*" means
-            // "not logged into an account".
-            let mut text = format!("{sender} joined {chan}");
+            // "not logged into an account". Format matches WeeChat's join
+            // line: "nick [account] (realname) (user@host) has joined
+            // #channel" — account/realname only when extended-join gave us
+            // them, user@host whenever the prefix carries it.
+            let mut text = sender.to_owned();
             if extended_join {
                 if let Some(acc) = account {
                     if acc != "*" && !acc.is_empty() {
-                        text.push_str(&format!(" (account: {acc})"));
+                        text.push_str(&format!(" [{acc}]"));
+                    }
+                }
+                if let Some(rn) = realname {
+                    if !rn.is_empty() {
+                        text.push_str(&format!(" ({rn})"));
                     }
                 }
             }
+            if let Some(uh) = userhost(message) {
+                text.push_str(&format!(" ({uh})"));
+            }
+            text.push_str(&format!(" has joined {chan}"));
             (chan.clone(), text)
         }
         Command::PART(chan, reason) => (
@@ -779,7 +799,7 @@ async fn route_incoming(
     granted_caps: &mut HashSet<String>,
     active_batches: &mut HashMap<String, (Option<String>, Vec<Message>)>,
     features: &mut ServerFeatures,
-    nick_status: &mut HashMap<String, (bool, Option<String>)>,
+    nick_status: &mut HashMap<String, bool>,
 ) {
     let our_nick = client.current_nickname();
     let sender = message.source_nickname().unwrap_or("?");
@@ -797,15 +817,15 @@ async fn route_incoming(
     let send_names = |tx: &async_channel::Sender<IrcEvent>,
                        channel: &str,
                        members: &HashMap<String, Vec<String>>,
-                       status: &HashMap<String, (bool, Option<String>)>| {
+                       status: &HashMap<String, bool>| {
         let nicks: Vec<NickInfo> = members
             .get(channel)
             .cloned()
             .unwrap_or_default()
             .into_iter()
             .map(|nick| {
-                let (away, account) = status.get(&nick).cloned().unwrap_or((false, None));
-                NickInfo { nick, away, account }
+                let away = status.get(&nick).copied().unwrap_or(false);
+                NickInfo { nick, away }
             })
             .collect();
         let tx = tx.clone();
@@ -886,20 +906,22 @@ async fn route_incoming(
                     // legacy opers-only flag — so sending the WHOX field
                     // selector as text round-trips through that lossy
                     // shape and gets silently dropped on serialization,
-                    // degrading the server to a legacy WHOREPLY.
-                    let _ = client.send(Command::Raw("WHO".to_owned(), vec![channel.clone(), "%nfa".to_owned()]));
+                    // degrading the server to a legacy WHOREPLY. Only
+                    // asking for nick+flags (not account) — WeeChat's
+                    // nicklist doesn't show account either; it surfaces via
+                    // extended-join/account-notify instead.
+                    let _ = client.send(Command::Raw("WHO".to_owned(), vec![channel.clone(), "%nf".to_owned()]));
                 }
             }
             return;
         }
         // RPL_WHOSPCRPL (354, WHOX) — not in the crate's Response enum, so
-        // it arrives as Raw. args = [<our_nick>, nick, flags, account]
-        // given our fixed "%nfa" field request order (n,f,a).
+        // it arrives as Raw. args = [<our_nick>, nick, flags] given our
+        // fixed "%nf" field request order (n,f).
         Command::Raw(cmd, args) if cmd == "354" => {
-            if let (Some(nick), Some(flags), Some(account)) = (args.get(1), args.get(2), args.get(3)) {
+            if let (Some(nick), Some(flags)) = (args.get(1), args.get(2)) {
                 let away = flags.starts_with('G'); // H = here, G = gone (away)
-                let account = if account == "0" { None } else { Some(account.clone()) };
-                nick_status.insert(nick.clone(), (away, account));
+                nick_status.insert(nick.clone(), away);
             }
             return;
         }
@@ -962,7 +984,7 @@ async fn route_incoming(
                 Some(r) => format!("{sender} is away: {r}"),
                 None => format!("{sender} is no longer away"),
             };
-            nick_status.entry(sender.to_owned()).or_insert((false, None)).0 = reason.is_some();
+            nick_status.insert(sender.to_owned(), reason.is_some());
             broadcast_to_shared(tx, channel_members, text).await;
             let affected: Vec<String> =
                 channel_members.iter().filter(|(_, m)| m.iter().any(|n| n == sender)).map(|(c, _)| c.clone()).collect();
@@ -971,20 +993,16 @@ async fn route_incoming(
             }
             return;
         }
+        // account-notify doesn't touch nick_status (we no longer track
+        // account there — see NickInfo) — it just announces the change,
+        // same as WeeChat does, rather than decorating the nicklist.
         Command::ACCOUNT(account) => {
             let text = if account == "*" {
                 format!("{sender} logged out")
             } else {
                 format!("{sender} authenticated as {account}")
             };
-            nick_status.entry(sender.to_owned()).or_insert((false, None)).1 =
-                if account == "*" { None } else { Some(account.clone()) };
             broadcast_to_shared(tx, channel_members, text).await;
-            let affected: Vec<String> =
-                channel_members.iter().filter(|(_, m)| m.iter().any(|n| n == sender)).map(|(c, _)| c.clone()).collect();
-            for chan in &affected {
-                send_names(tx, chan, channel_members, nick_status).await;
-            }
             return;
         }
         Command::CHGHOST(new_user, new_host) => {

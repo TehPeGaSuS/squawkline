@@ -72,8 +72,10 @@ cargo build --release
 - RPL_ISUPPORT (CHANTYPES, PREFIX, WHOX) actually respected — channel-vs-
   private detection and nicklist rank-marker stripping use what the server
   reports rather than a hardcoded guess.
-- WHOX: nicklist shows account name and away status per user, on networks
-  that support it (InspIRCd, UnrealIRCd, Solanum, Ergo all do).
+- WHOX: nicklist dims away users, on networks that support it (InspIRCd,
+  UnrealIRCd, Solanum, Ergo all do). Account name isn't shown in the
+  nicklist — matching WeeChat, it surfaces contextually instead, via
+  extended-join and account-notify.
 - CTCP auto-replies (VERSION, PING, TIME, CLIENTINFO, SOURCE).
 - A nicklist per channel.
 - Commands: `/join`, `/part`, `/nick`, `/msg`, `/invite`, `/raw`.
