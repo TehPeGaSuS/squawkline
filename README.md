@@ -2,6 +2,10 @@
 
 IRC client written in Rust, using GTK4.
 
+> ⚠️ **Work in progress.** Not suitable for daily usage. Features are
+> half-built, config formats will change without warning, and bugs are
+> practically a core feature at this point. Compile at your own peril.
+
 ## Building from source
 
 You'll need a Rust toolchain ([rustup.rs](https://rustup.rs)) and GTK4's
