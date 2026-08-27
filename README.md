@@ -2,9 +2,10 @@
 
 IRC client written in Rust, using GTK4.
 
-> ⚠️ **Work in progress.** Not suitable for daily usage. Features are
-> half-built, config formats will change without warning, and bugs are
-> practically a core feature at this point. Compile at your own peril.
+> [!WARNING]
+> Work in progress. Not suitable for daily usage. Features are half-built,
+> config formats will change without warning, and bugs are practically a
+> core feature at this point. Compile at your own peril.
 
 ## Building from source
 
