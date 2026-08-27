@@ -9,8 +9,25 @@ IRC client written in Rust, using GTK4.
 
 ## Building from source
 
-You'll need a Rust toolchain ([rustup.rs](https://rustup.rs)) and GTK4's
-development headers.
+You'll need a Rust toolchain and GTK4's development headers.
+
+### Installing / updating Rust
+
+The recommended way is [rustup](https://rustup.rs), which also keeps Rust
+itself up to date (distro-packaged Rust is often too old for this project).
+
+```
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+Follow the prompts, then restart your shell (or run `source
+"$HOME/.cargo/env"`). To update later:
+
+```
+rustup update
+```
+
+### GTK4 development headers
 
 **Ubuntu / Debian**
 ```
