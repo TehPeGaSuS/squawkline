@@ -86,7 +86,16 @@ enum IrcEvent {
     // when they actually happened, not when we happened to see them.
     Line { server: String, target: String, text: String, time: Option<String> },
     // The full, current member list for `server`/`channel` (replaces, not merges).
-    Names { server: String, channel: String, nicks: Vec<String> },
+    Names { server: String, channel: String, nicks: Vec<NickInfo> },
+}
+
+// A nicklist entry enriched with WHOX data (away status, account), when
+// known — falls back to just the name if we haven't WHOX'd yet.
+#[derive(Clone)]
+struct NickInfo {
+    nick: String,
+    away: bool,
+    account: Option<String>,
 }
 
 fn main() -> glib::ExitCode {
@@ -150,7 +159,7 @@ fn build_ui(app: &Application) {
     // landing at the bottom of the (otherwise unsorted) sidebar.
     let server_rows: Rc<RefCell<HashMap<String, Vec<String>>>> = Rc::new(RefCell::new(HashMap::new()));
     let server_order: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-    let channel_nicks: Rc<RefCell<HashMap<String, Vec<String>>>> = Rc::new(RefCell::new(HashMap::new()));
+    let channel_nicks: Rc<RefCell<HashMap<String, Vec<NickInfo>>>> = Rc::new(RefCell::new(HashMap::new()));
     let selected: Rc<RefCell<(String, String)>> = Rc::new(RefCell::new((String::new(), String::new())));
 
     let get_or_create_buffer = {
@@ -210,9 +219,19 @@ fn build_ui(app: &Application) {
                 nicklist.remove(&row);
             }
             if let Some(nicks) = channel_nicks.borrow().get(&key(server, target)) {
-                for nick in nicks {
+                for info in nicks {
+                    let label_text = match &info.account {
+                        Some(acc) => format!("{} ({acc})", info.nick),
+                        None => info.nick.clone(),
+                    };
+                    let label = Label::builder().label(&label_text).xalign(0.0).build();
+                    if info.away {
+                        // Dim rather than hide — still relevant to know
+                        // who's around, just not actively present.
+                        label.set_opacity(0.5);
+                    }
                     let row = ListBoxRow::new();
-                    row.set_child(Some(&Label::new(Some(nick))));
+                    row.set_child(Some(&label));
                     nicklist.append(&row);
                 }
             }
@@ -377,8 +396,12 @@ async fn run_irc(cfg: ServerConfig, tx: async_channel::Sender<IrcEvent>, out_rx:
     // Batches in progress (batch cap): reference id -> (batch type, buffered
     // child messages), populated by BATCH +id and flushed on BATCH -id.
     let mut active_batches: HashMap<String, (Option<String>, Vec<Message>)> = HashMap::new();
-    // CHANTYPES/PREFIX from RPL_ISUPPORT (005), updated as it arrives.
+    // CHANTYPES/PREFIX/WHOX from RPL_ISUPPORT (005), updated as it arrives.
     let mut features = ServerFeatures::default();
+    // Away/account status per nick (WHOX, kept fresh by away-notify and
+    // account-notify) — a user property, not a per-channel one, so it's
+    // keyed by nick alone and shared across every channel on this server.
+    let mut nick_status: HashMap<String, (bool, Option<String>)> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -389,6 +412,7 @@ async fn run_irc(cfg: ServerConfig, tx: async_channel::Sender<IrcEvent>, out_rx:
                             &server_name, &client, &message, &tx,
                             &mut channel_members, &mut names_buffer,
                             &mut granted_caps, &mut active_batches, &mut features,
+                            &mut nick_status,
                         ).await;
                     }
                     None => break,
@@ -441,11 +465,16 @@ const WANTED_CAPS: [Capability; 14] = [
 struct ServerFeatures {
     chantypes: String,
     prefixes: String,
+    // WHOX (bare "WHOX" ISUPPORT token, no value): lets WHO be asked for
+    // exactly the fields we want (nick/away-flags/account) instead of the
+    // fixed legacy WHOREPLY shape, and is supported by every real-world
+    // ircd checked (InspIRCd, UnrealIRCd, Solanum, Ergo).
+    whox: bool,
 }
 
 impl Default for ServerFeatures {
     fn default() -> Self {
-        Self { chantypes: "#&".to_owned(), prefixes: "@+".to_owned() }
+        Self { chantypes: "#&".to_owned(), prefixes: "@+".to_owned(), whox: false }
     }
 }
 
@@ -460,6 +489,8 @@ impl ServerFeatures {
                 if let Some(close) = v.find(')') {
                     self.prefixes = v[close + 1..].to_owned();
                 }
+            } else if tok.split('=').next().unwrap_or(tok).eq_ignore_ascii_case("WHOX") {
+                self.whox = true;
             }
         }
     }
@@ -748,6 +779,7 @@ async fn route_incoming(
     granted_caps: &mut HashSet<String>,
     active_batches: &mut HashMap<String, (Option<String>, Vec<Message>)>,
     features: &mut ServerFeatures,
+    nick_status: &mut HashMap<String, (bool, Option<String>)>,
 ) {
     let our_nick = client.current_nickname();
     let sender = message.source_nickname().unwrap_or("?");
@@ -762,8 +794,20 @@ async fn route_incoming(
         }
     }
 
-    let send_names = |tx: &async_channel::Sender<IrcEvent>, channel: &str, members: &HashMap<String, Vec<String>>| {
-        let nicks = members.get(channel).cloned().unwrap_or_default();
+    let send_names = |tx: &async_channel::Sender<IrcEvent>,
+                       channel: &str,
+                       members: &HashMap<String, Vec<String>>,
+                       status: &HashMap<String, (bool, Option<String>)>| {
+        let nicks: Vec<NickInfo> = members
+            .get(channel)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|nick| {
+                let (away, account) = status.get(&nick).cloned().unwrap_or((false, None));
+                NickInfo { nick, away, account }
+            })
+            .collect();
         let tx = tx.clone();
         let server = server_name.to_owned();
         let channel = channel.to_owned();
@@ -806,8 +850,14 @@ async fn route_incoming(
                         .split_whitespace()
                         // Which leading characters are rank markers (not
                         // part of the nick) comes from the server's own
-                        // PREFIX (ISUPPORT), not a hardcoded guess.
-                        .map(|n| n.trim_start_matches(|c| features.prefixes.contains(c)).to_owned()),
+                        // PREFIX (ISUPPORT), not a hardcoded guess. With
+                        // userhost-in-names granted, each entry is also
+                        // "nick!user@host" rather than a bare nick — strip
+                        // everything from '!' onward.
+                        .map(|n| {
+                            let n = n.trim_start_matches(|c| features.prefixes.contains(c));
+                            n.split('!').next().unwrap_or(n).to_owned()
+                        }),
                 );
             }
             return;
@@ -818,12 +868,45 @@ async fn route_incoming(
                 nicks.sort_unstable();
                 nicks.dedup();
                 channel_members.insert(channel.clone(), nicks);
-                send_names(tx, channel, channel_members).await;
+                send_names(tx, channel, channel_members, nick_status).await;
                 // Backfill recent history right after joining, if the
                 // server supports it — this is the whole point of
                 // draft/chathistory: no more "joined and missed everything".
                 if granted_caps.contains("draft/chathistory") {
                     let _ = client.send(format!("CHATHISTORY LATEST {channel} * 50").as_str());
+                }
+                // Ask for account/away status for everyone in the channel
+                // in one shot, if the server supports it (near-universal:
+                // InspIRCd, UnrealIRCd, Solanum, Ergo all do) — otherwise
+                // the nicklist just shows bare names, as before.
+                if features.whox {
+                    // Built as Command::Raw directly, not parsed from a
+                    // string: the crate's own WHO variant is
+                    // WHO(Option<String>, Option<bool>) — a mask plus the
+                    // legacy opers-only flag — so sending the WHOX field
+                    // selector as text round-trips through that lossy
+                    // shape and gets silently dropped on serialization,
+                    // degrading the server to a legacy WHOREPLY.
+                    let _ = client.send(Command::Raw("WHO".to_owned(), vec![channel.clone(), "%nfa".to_owned()]));
+                }
+            }
+            return;
+        }
+        // RPL_WHOSPCRPL (354, WHOX) — not in the crate's Response enum, so
+        // it arrives as Raw. args = [<our_nick>, nick, flags, account]
+        // given our fixed "%nfa" field request order (n,f,a).
+        Command::Raw(cmd, args) if cmd == "354" => {
+            if let (Some(nick), Some(flags), Some(account)) = (args.get(1), args.get(2), args.get(3)) {
+                let away = flags.starts_with('G'); // H = here, G = gone (away)
+                let account = if account == "0" { None } else { Some(account.clone()) };
+                nick_status.insert(nick.clone(), (away, account));
+            }
+            return;
+        }
+        Command::Response(Response::RPL_ENDOFWHO, args) => {
+            if let Some(channel) = args.get(1) {
+                if channel_members.contains_key(channel) {
+                    send_names(tx, channel, channel_members, nick_status).await;
                 }
             }
             return;
@@ -831,7 +914,7 @@ async fn route_incoming(
         Command::JOIN(chan, ..) => {
             if sender != our_nick {
                 channel_members.entry(chan.clone()).or_default().push(sender.to_owned());
-                send_names(tx, chan, channel_members).await;
+                send_names(tx, chan, channel_members, nick_status).await;
             }
         }
         Command::PART(chan, _) | Command::KICK(chan, _, _) => {
@@ -839,7 +922,7 @@ async fn route_incoming(
             if let Some(members) = channel_members.get_mut(chan) {
                 members.retain(|n| n != left);
             }
-            send_names(tx, chan, channel_members).await;
+            send_names(tx, chan, channel_members, nick_status).await;
         }
         Command::QUIT(_) => {
             let affected: Vec<String> = channel_members
@@ -851,10 +934,13 @@ async fn route_incoming(
                 if let Some(members) = channel_members.get_mut(chan) {
                     members.retain(|n| n != sender);
                 }
-                send_names(tx, chan, channel_members).await;
+                send_names(tx, chan, channel_members, nick_status).await;
             }
         }
         Command::NICK(new_nick) => {
+            if let Some(status) = nick_status.remove(sender) {
+                nick_status.insert(new_nick.clone(), status);
+            }
             let affected: Vec<String> = channel_members
                 .iter()
                 .filter(|(_, members)| members.iter().any(|n| n == sender))
@@ -868,7 +954,7 @@ async fn route_incoming(
                         }
                     }
                 }
-                send_names(tx, chan, channel_members).await;
+                send_names(tx, chan, channel_members, nick_status).await;
             }
         }
         Command::AWAY(reason) => {
@@ -876,7 +962,13 @@ async fn route_incoming(
                 Some(r) => format!("{sender} is away: {r}"),
                 None => format!("{sender} is no longer away"),
             };
+            nick_status.entry(sender.to_owned()).or_insert((false, None)).0 = reason.is_some();
             broadcast_to_shared(tx, channel_members, text).await;
+            let affected: Vec<String> =
+                channel_members.iter().filter(|(_, m)| m.iter().any(|n| n == sender)).map(|(c, _)| c.clone()).collect();
+            for chan in &affected {
+                send_names(tx, chan, channel_members, nick_status).await;
+            }
             return;
         }
         Command::ACCOUNT(account) => {
@@ -885,7 +977,14 @@ async fn route_incoming(
             } else {
                 format!("{sender} authenticated as {account}")
             };
+            nick_status.entry(sender.to_owned()).or_insert((false, None)).1 =
+                if account == "*" { None } else { Some(account.clone()) };
             broadcast_to_shared(tx, channel_members, text).await;
+            let affected: Vec<String> =
+                channel_members.iter().filter(|(_, m)| m.iter().any(|n| n == sender)).map(|(c, _)| c.clone()).collect();
+            for chan in &affected {
+                send_names(tx, chan, channel_members, nick_status).await;
+            }
             return;
         }
         Command::CHGHOST(new_user, new_host) => {

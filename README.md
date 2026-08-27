@@ -69,9 +69,11 @@ cargo build --release
   joining a channel, on networks that support it.
 - `draft/multiline`: reconstructed into a single message.
 - `standard-replies` (FAIL/WARN/NOTE) shown legibly instead of vanishing.
-- RPL_ISUPPORT (CHANTYPES, PREFIX) actually respected — channel-vs-private
-  detection and nicklist rank-marker stripping use what the server
+- RPL_ISUPPORT (CHANTYPES, PREFIX, WHOX) actually respected — channel-vs-
+  private detection and nicklist rank-marker stripping use what the server
   reports rather than a hardcoded guess.
+- WHOX: nicklist shows account name and away status per user, on networks
+  that support it (InspIRCd, UnrealIRCd, Solanum, Ergo all do).
 - CTCP auto-replies (VERSION, PING, TIME, CLIENTINFO, SOURCE).
 - A nicklist per channel.
 - Commands: `/join`, `/part`, `/nick`, `/msg`, `/invite`, `/raw`.
