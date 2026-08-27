@@ -377,6 +377,8 @@ async fn run_irc(cfg: ServerConfig, tx: async_channel::Sender<IrcEvent>, out_rx:
     // Batches in progress (batch cap): reference id -> (batch type, buffered
     // child messages), populated by BATCH +id and flushed on BATCH -id.
     let mut active_batches: HashMap<String, (Option<String>, Vec<Message>)> = HashMap::new();
+    // CHANTYPES/PREFIX from RPL_ISUPPORT (005), updated as it arrives.
+    let mut features = ServerFeatures::default();
 
     loop {
         tokio::select! {
@@ -386,7 +388,7 @@ async fn run_irc(cfg: ServerConfig, tx: async_channel::Sender<IrcEvent>, out_rx:
                         route_incoming(
                             &server_name, &client, &message, &tx,
                             &mut channel_members, &mut names_buffer,
-                            &mut granted_caps, &mut active_batches,
+                            &mut granted_caps, &mut active_batches, &mut features,
                         ).await;
                     }
                     None => break,
@@ -413,7 +415,7 @@ async fn run_irc(cfg: ServerConfig, tx: async_channel::Sender<IrcEvent>, out_rx:
 // configured, since requesting it with nothing to authenticate is pointless.
 // Also used post-registration (cap-notify) to decide which newly-offered
 // capabilities are worth auto-requesting via CAP NEW.
-const WANTED_CAPS: [Capability; 13] = [
+const WANTED_CAPS: [Capability; 14] = [
     Capability::MultiPrefix,
     Capability::AwayNotify,
     Capability::AccountNotify,
@@ -425,9 +427,43 @@ const WANTED_CAPS: [Capability; 13] = [
     Capability::UserhostInNames,
     Capability::Batch,
     Capability::ExtendedJoin,
+    Capability::Custom("message-tags"),
     Capability::Custom("draft/chathistory"),
     Capability::Custom("draft/multiline"),
 ];
+
+// RPL_ISUPPORT (005) tokens we actually act on: CHANTYPES tells us which
+// prefix characters mean "this target is a channel" (used instead of a
+// hardcoded guess), PREFIX's symbol half tells us which characters in a
+// NAMES reply are rank markers to strip rather than part of the nick.
+// Defaults are the common case, in effect until/unless a server says
+// otherwise or for a server that never sends ISUPPORT at all.
+struct ServerFeatures {
+    chantypes: String,
+    prefixes: String,
+}
+
+impl Default for ServerFeatures {
+    fn default() -> Self {
+        Self { chantypes: "#&".to_owned(), prefixes: "@+".to_owned() }
+    }
+}
+
+impl ServerFeatures {
+    fn apply_isupport(&mut self, tokens: &[String]) {
+        for tok in tokens {
+            if let Some(v) = tok.strip_prefix("CHANTYPES=") {
+                self.chantypes = v.to_owned();
+            } else if let Some(v) = tok.strip_prefix("PREFIX=") {
+                // Format is "(modes)symbols", e.g. "(ov)@+" — modes and
+                // symbols are positionally paired; we only need the symbols.
+                if let Some(close) = v.find(')') {
+                    self.prefixes = v[close + 1..].to_owned();
+                }
+            }
+        }
+    }
+}
 
 // The capability list lands in the 3rd tuple field of `Command::CAP` for
 // the common 3-arg wire shape ("<nick> SUB :caps") and only in the 4th for
@@ -556,7 +592,14 @@ async fn negotiate(
 // the live path and batch replay (chathistory, netsplit/netjoin, unknown
 // vendor batches) — `ctcp_client` is `Some` only for the live path, so a
 // replayed historical CTCP request doesn't trigger a fresh auto-reply.
-fn format_display(our_nick: &str, sender: &str, message: &Message, ctcp_client: Option<&Client>, extended_join: bool) -> (String, String) {
+fn format_display(
+    our_nick: &str,
+    sender: &str,
+    message: &Message,
+    ctcp_client: Option<&Client>,
+    extended_join: bool,
+    chantypes: &str,
+) -> (String, String) {
     match &message.command {
         Command::PRIVMSG(target, text) if text.starts_with('\u{1}') && text.ends_with('\u{1}') => {
             // A CTCP request (VERSION, PING, TIME, ...), not a chat
@@ -585,8 +628,10 @@ fn format_display(our_nick: &str, sender: &str, message: &Message, ctcp_client: 
             // registration these can target a placeholder like "AUTH"
             // rather than our actual nick, so check the channel prefix
             // instead of comparing against our_nick. Channel NOTICEs still
-            // go to their channel.
-            let target = if target.starts_with(['#', '&', '!', '+']) { target.as_str() } else { SERVER_TARGET };
+            // go to their channel. Which characters mean "channel" comes
+            // from the server's own CHANTYPES (ISUPPORT), not a guess —
+            // most networks use "#&" but some add others.
+            let target = if target.starts_with(|c| chantypes.contains(c)) { target.as_str() } else { SERVER_TARGET };
             (target.to_owned(), format!("-{sender}- {text}"))
         }
         Command::JOIN(chan, account, _realname) => {
@@ -629,6 +674,13 @@ fn format_display(our_nick: &str, sender: &str, message: &Message, ctcp_client: 
             format!("topic: {}", args.get(2).cloned().unwrap_or_default()),
         ),
         Command::Response(_, args) => (SERVER_TARGET.to_owned(), args.join(" ")),
+        // FAIL/WARN/NOTE (standard-replies): not in the crate's Command
+        // enum, so they arrive as Raw. Without this, errors from newer
+        // specs we rely on (chathistory, multiline) would silently vanish
+        // into the generic raw-line fallback instead of being legible.
+        Command::Raw(cmd, args) if matches!(cmd.as_str(), "FAIL" | "WARN" | "NOTE") => {
+            (SERVER_TARGET.to_owned(), format!("[{cmd}] {}", args.join(" ")))
+        }
         _ => (SERVER_TARGET.to_owned(), display_raw(message)),
     }
 }
@@ -647,6 +699,7 @@ async fn flush_batch(
     tx: &async_channel::Sender<IrcEvent>,
     batch_type: Option<String>,
     messages: Vec<Message>,
+    chantypes: &str,
 ) {
     if batch_type.as_deref() == Some("DRAFT/MULTILINE") {
         let mut target: Option<String> = None;
@@ -680,7 +733,7 @@ async fn flush_batch(
         let sender = m.source_nickname().unwrap_or("?");
         // extended_join doesn't matter for replay — historical JOINs are
         // rare and the account annotation isn't worth the plumbing here.
-        let (target, text) = format_display(our_nick, sender, m, None, false);
+        let (target, text) = format_display(our_nick, sender, m, None, false, chantypes);
         let _ = tx.send(IrcEvent::Line { server: server_name.to_owned(), target, text, time: tag_time(m) }).await;
     }
 }
@@ -694,6 +747,7 @@ async fn route_incoming(
     names_buffer: &mut HashMap<String, Vec<String>>,
     granted_caps: &mut HashSet<String>,
     active_batches: &mut HashMap<String, (Option<String>, Vec<Message>)>,
+    features: &mut ServerFeatures,
 ) {
     let our_nick = client.current_nickname();
     let sender = message.source_nickname().unwrap_or("?");
@@ -738,6 +792,11 @@ async fn route_incoming(
     };
 
     match &message.command {
+        Command::Response(Response::RPL_ISUPPORT, args) => {
+            features.apply_isupport(args);
+            // No `return`: falls through to the generic Response display
+            // below, same as before this arm existed.
+        }
         Command::Response(Response::RPL_NAMREPLY, args) => {
             // args: [our_nick, "=", "#chan", "nick1 @nick2 +nick3 ..."]
             if let (Some(channel), Some(names)) = (args.get(2), args.last()) {
@@ -745,7 +804,10 @@ async fn route_incoming(
                 entry.extend(
                     names
                         .split_whitespace()
-                        .map(|n| n.trim_start_matches(['@', '+', '%', '~', '&']).to_owned()),
+                        // Which leading characters are rank markers (not
+                        // part of the nick) comes from the server's own
+                        // PREFIX (ISUPPORT), not a hardcoded guess.
+                        .map(|n| n.trim_start_matches(|c| features.prefixes.contains(c)).to_owned()),
                 );
             }
             return;
@@ -864,7 +926,7 @@ async fn route_incoming(
                 active_batches.insert(id.to_owned(), (subcmd.as_ref().map(|s| s.to_str().to_owned()), Vec::new()));
             } else if let Some(id) = reftag.strip_prefix('-') {
                 if let Some((batch_type, messages)) = active_batches.remove(id) {
-                    flush_batch(server_name, our_nick, tx, batch_type, messages).await;
+                    flush_batch(server_name, our_nick, tx, batch_type, messages, &features.chantypes).await;
                 }
             }
             return;
@@ -873,7 +935,7 @@ async fn route_incoming(
     }
 
     let extended_join = granted_caps.contains("extended-join");
-    let (target, text) = format_display(our_nick, sender, message, Some(client), extended_join);
+    let (target, text) = format_display(our_nick, sender, message, Some(client), extended_join, &features.chantypes);
     let _ = tx.send(IrcEvent::Line { server: server_name.to_owned(), target, text, time: tag_time(message) }).await;
 }
 
