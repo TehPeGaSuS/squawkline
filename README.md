@@ -86,6 +86,10 @@ On first run, a default config is written to
 `~/.config/squawkline/config.toml`. Add more `[[servers]]` entries to
 connect to more than one network:
 
+> Editing the TOML file by hand is a stopgap — a GUI settings menu covering
+> servers, SASL, and other preferences is planned to eventually replace
+> manual config editing entirely.
+
 ```toml
 [[servers]]
 name = "libera"
