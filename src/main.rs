@@ -895,11 +895,14 @@ async fn route_incoming(
                 if granted_caps.contains("draft/chathistory") {
                     let _ = client.send(format!("CHATHISTORY LATEST {channel} * 50").as_str());
                 }
-                // Ask for account/away status for everyone in the channel
-                // in one shot, if the server supports it (near-universal:
-                // InspIRCd, UnrealIRCd, Solanum, Ergo all do) — otherwise
-                // the nicklist just shows bare names, as before.
-                if features.whox {
+                // Ask for away status for everyone in the channel in one
+                // shot, if the server supports WHOX (near-universal:
+                // InspIRCd, UnrealIRCd, Solanum, Ergo all do). Also gated
+                // on away-notify (matches WeeChat's irc_channel_check_whox):
+                // without it, this snapshot goes stale the moment anyone's
+                // status changes with no way to refresh it, so there's no
+                // point spending the round-trip.
+                if features.whox && granted_caps.contains("away-notify") {
                     // Built as Command::Raw directly, not parsed from a
                     // string: the crate's own WHO variant is
                     // WHO(Option<String>, Option<bool>) — a mask plus the
